@@ -1,12 +1,10 @@
-// Count reachable positions in Dobutsu Shogi from the initial position.
+// Dobutsu Shogi: count reachable positions and solve by retrograde analysis.
 //
-// BFS level by level with sort-merge dedup (no hash table).
-//
-// Terminal positions (no successors):
-//   - forced-win: Black can capture White Lion
-//   - forced-loss: White Lion at row 3, Black cannot capture
-//
-// Chick drops on row 0 ARE allowed.
+// Phase 1: BFS from initial position (sort-merge, no hash table).
+// Phase 2: Classify terminals, compute out-degrees.
+// Phase 3: Build reverse edge table (CSR) via batched sort-merge.
+// Phase 4: Retrograde BFS to classify all positions as WIN/LOSE/DRAW.
+// Phase 5: Report result for initial position.
 
 use std::time::Instant;
 
@@ -120,7 +118,6 @@ fn is_terminal(pos: u64) -> bool {
 }
 
 fn generate_successors_canonical(pos: u64, out: &mut Vec<u64>) {
-    // Board moves — each successor is immediately flip+canonical'd
     for sq in 0..NUM_SQ {
         let p = get_sq(pos, sq);
         if !(1..=5).contains(&p) { continue; }
@@ -134,12 +131,10 @@ fn generate_successors_canonical(pos: u64, out: &mut Vec<u64>) {
             let target = get_sq(pos, nsq);
             if (1..=5).contains(&target) { continue; }
             if target == 6 { continue; }
-
             let mut np = pos;
             np = set_sq(np, sq, 0);
             let new_piece = if p == 4 && nr == 0 { 5 } else { p };
             np = set_sq(np, nsq, new_piece);
-
             if (7..=10).contains(&target) {
                 let captured_type = target - 5;
                 let hi = match captured_type {
@@ -150,7 +145,6 @@ fn generate_successors_canonical(pos: u64, out: &mut Vec<u64>) {
             out.push(canonical(flip_perspective(np)));
         }
     }
-    // Drops
     for hi in 0..3 {
         let cnt = get_hand(pos, hi);
         if cnt == 0 { continue; }
@@ -165,7 +159,6 @@ fn generate_successors_canonical(pos: u64, out: &mut Vec<u64>) {
     }
 }
 
-// Merge `new_sorted` (sorted, non-empty) into `known` (sorted) in-place.
 fn merge_into(known: &mut Vec<u64>, new_sorted: &[u64]) {
     let old_len = known.len();
     known.resize(old_len + new_sorted.len(), 0);
@@ -175,78 +168,269 @@ fn merge_into(known: &mut Vec<u64>, new_sorted: &[u64]) {
     while i > 0 && j > 0 {
         k -= 1;
         if known[i - 1] >= new_sorted[j - 1] {
-            known[k] = known[i - 1];
-            i -= 1;
+            known[k] = known[i - 1]; i -= 1;
         } else {
-            known[k] = new_sorted[j - 1];
-            j -= 1;
+            known[k] = new_sorted[j - 1]; j -= 1;
         }
     }
-    while j > 0 {
-        k -= 1;
-        known[k] = new_sorted[j - 1];
-        j -= 1;
-    }
+    while j > 0 { k -= 1; known[k] = new_sorted[j - 1]; j -= 1; }
 }
 
-// Find elements in `candidates` (sorted, deduped) that are NOT in `known` (sorted).
 fn diff_sorted(known: &[u64], candidates: &[u64], out: &mut Vec<u64>) {
     out.clear();
     let mut ki = 0;
     for &c in candidates {
-        while ki < known.len() && known[ki] < c {
-            ki += 1;
-        }
-        if ki >= known.len() || known[ki] != c {
-            out.push(c);
-        }
+        while ki < known.len() && known[ki] < c { ki += 1; }
+        if ki >= known.len() || known[ki] != c { out.push(c); }
     }
 }
 
-fn main() {
+// ─── Phase 1: BFS ─────────────────────────────────────────────────────────────
+
+fn bfs() -> Vec<u64> {
     let init = canonical(initial_position());
     let mut known: Vec<u64> = vec![init];
     let mut frontier: Vec<u64> = vec![init];
     let mut raw_succs: Vec<u64> = Vec::new();
     let mut new_positions: Vec<u64> = Vec::new();
 
-    let start = Instant::now();
-
-    for level in 1.. {
+    for _level in 1.. {
         raw_succs.clear();
         for &pos in &frontier {
             if !is_terminal(pos) {
                 generate_successors_canonical(pos, &mut raw_succs);
             }
         }
-
-        if raw_succs.is_empty() {
-            break;
-        }
-
+        if raw_succs.is_empty() { break; }
         raw_succs.sort_unstable();
         raw_succs.dedup();
-
         diff_sorted(&known, &raw_succs, &mut new_positions);
-
-        if new_positions.is_empty() {
-            break;
-        }
-
+        if new_positions.is_empty() { break; }
         merge_into(&mut known, &new_positions);
-
-        eprintln!(
-            "[{:>7.1}s] level {:>3}: +{:>10}  = {:>10} total  (raw succs: {:>10})",
-            start.elapsed().as_secs_f64(),
-            level,
-            new_positions.len(),
-            known.len(),
-            raw_succs.len()
-        );
-
         std::mem::swap(&mut frontier, &mut new_positions);
     }
+    known
+}
 
-    eprintln!("done in {:.1}s", start.elapsed().as_secs_f64());
-    println!("Reachable positions: {}", known.len());
+// ─── Phase 3: Build reverse CSR via batched sort-merge ─────────────────────────
+
+const BATCH_CAP: usize = 100_000_000;
+
+const STATUS_UNKNOWN: u8 = 0;
+const STATUS_WIN: u8 = 1;
+const STATUS_LOSE: u8 = 2;
+
+fn flush_indeg_batch(known: &[u64], in_degree: &mut [u32], batch: &mut Vec<u64>) {
+    batch.sort_unstable();
+    let mut ki = 0usize;
+    for &s in batch.iter() {
+        while known[ki] < s { ki += 1; }
+        in_degree[ki] += 1;
+    }
+    batch.clear();
+}
+
+struct EdgeBatch {
+    succs: Vec<u64>,
+    parents: Vec<u32>,
+}
+
+impl EdgeBatch {
+    fn new() -> Self { Self { succs: Vec::new(), parents: Vec::new() } }
+    fn len(&self) -> usize { self.succs.len() }
+    fn clear(&mut self) { self.succs.clear(); self.parents.clear(); }
+    fn push(&mut self, succ: u64, parent: u32) {
+        self.succs.push(succ);
+        self.parents.push(parent);
+    }
+}
+
+fn flush_edge_batch(
+    known: &[u64],
+    rev_edges: &mut [u32],
+    write_pos: &mut [u32],
+    batch: &mut EdgeBatch,
+) {
+    let mut indices: Vec<u32> = (0..batch.len() as u32).collect();
+    indices.sort_unstable_by_key(|&i| batch.succs[i as usize]);
+
+    let mut ki = 0usize;
+    for &idx in &indices {
+        let s = batch.succs[idx as usize];
+        let parent = batch.parents[idx as usize];
+        while known[ki] < s { ki += 1; }
+        let wp = write_pos[ki] as usize;
+        rev_edges[wp] = parent;
+        write_pos[ki] += 1;
+    }
+    batch.clear();
+}
+
+fn build_reverse_csr(
+    known: &[u64],
+    status: &[u8],
+) -> (Vec<u32>, Vec<u32>) {
+    let n = known.len();
+
+    // Pass 1: compute in-degree via batched sort-merge
+    let mut in_degree: Vec<u32> = vec![0; n];
+    let mut batch: Vec<u64> = Vec::with_capacity(BATCH_CAP + 64);
+    let mut succ_buf: Vec<u64> = Vec::new();
+
+    for i in 0..n {
+        if status[i] != STATUS_UNKNOWN { continue; }
+        succ_buf.clear();
+        generate_successors_canonical(known[i], &mut succ_buf);
+        for &s in &succ_buf {
+            batch.push(s);
+        }
+        if batch.len() >= BATCH_CAP {
+            flush_indeg_batch(known, &mut in_degree, &mut batch);
+        }
+    }
+    if !batch.is_empty() {
+        flush_indeg_batch(known, &mut in_degree, &mut batch);
+    }
+    drop(batch);
+
+    // Build offsets (prefix sum)
+    let mut rev_offset: Vec<u32> = vec![0; n + 1];
+    for i in 0..n {
+        rev_offset[i + 1] = rev_offset[i] + in_degree[i];
+    }
+    let total_edges = rev_offset[n] as usize;
+    drop(in_degree);
+
+    // Pass 2: fill edges via batched sort-merge
+    let mut rev_edges: Vec<u32> = vec![0; total_edges];
+    let mut write_pos: Vec<u32> = rev_offset[..n].to_vec();
+    let mut edge_batch = EdgeBatch::new();
+
+    for i in 0..n {
+        if status[i] != STATUS_UNKNOWN { continue; }
+        succ_buf.clear();
+        generate_successors_canonical(known[i], &mut succ_buf);
+        for &s in &succ_buf {
+            edge_batch.push(s, i as u32);
+        }
+        if edge_batch.len() >= BATCH_CAP {
+            flush_edge_batch(known, &mut rev_edges, &mut write_pos, &mut edge_batch);
+        }
+    }
+    if edge_batch.len() > 0 {
+        flush_edge_batch(known, &mut rev_edges, &mut write_pos, &mut edge_batch);
+    }
+
+    (rev_offset, rev_edges)
+}
+
+// ─── Phase 4: Retrograde BFS ──────────────────────────────────────────────────
+
+fn retrograde(
+    status: &mut [u8],
+    remaining: &mut [u8],
+    rev_offset: &[u32],
+    rev_edges: &[u32],
+) {
+    let n = status.len();
+    let mut queue: Vec<u32> = Vec::new();
+    for i in 0..n {
+        if status[i] != STATUS_UNKNOWN {
+            queue.push(i as u32);
+        }
+    }
+
+    let mut qi = 0usize;
+    while qi < queue.len() {
+        let pi = queue[qi] as usize;
+        qi += 1;
+        let p_status = status[pi];
+
+        let start = rev_offset[pi] as usize;
+        let end = rev_offset[pi + 1] as usize;
+        for ei in start..end {
+            let pred = rev_edges[ei] as usize;
+            if status[pred] != STATUS_UNKNOWN { continue; }
+
+            if p_status == STATUS_LOSE {
+                status[pred] = STATUS_WIN;
+                queue.push(pred as u32);
+            } else if p_status == STATUS_WIN {
+                remaining[pred] -= 1;
+                if remaining[pred] == 0 {
+                    status[pred] = STATUS_LOSE;
+                    queue.push(pred as u32);
+                }
+            }
+        }
+    }
+}
+
+// ─── Main ──────────────────────────────────────────────────────────────────────
+
+fn main() {
+    let t0 = Instant::now();
+
+    // Phase 1: BFS
+    eprintln!("Phase 1: BFS...");
+    let known = bfs();
+    let n = known.len();
+    eprintln!("  {} reachable positions in {:.1}s", n, t0.elapsed().as_secs_f64());
+
+    // Phase 2: Classify terminals + compute out-degrees
+    eprintln!("Phase 2: Classify terminals...");
+    let mut status: Vec<u8> = vec![STATUS_UNKNOWN; n];
+    let mut remaining: Vec<u8> = vec![0; n];
+    let mut succ_buf: Vec<u64> = Vec::new();
+    let (mut win_t, mut lose_t) = (0usize, 0usize);
+
+    for i in 0..n {
+        let pos = known[i];
+        if is_terminal(pos) {
+            let wl = find_white_lion(pos);
+            if black_can_reach(pos, wl) {
+                status[i] = STATUS_WIN;
+                win_t += 1;
+            } else {
+                status[i] = STATUS_LOSE;
+                lose_t += 1;
+            }
+        } else {
+            succ_buf.clear();
+            generate_successors_canonical(pos, &mut succ_buf);
+            remaining[i] = succ_buf.len() as u8;
+        }
+    }
+    eprintln!("  terminals: {} win + {} lose = {} in {:.1}s",
+        win_t, lose_t, win_t + lose_t, t0.elapsed().as_secs_f64());
+
+    // Phase 3: Build reverse CSR
+    eprintln!("Phase 3: Build reverse edges...");
+    let (rev_offset, rev_edges) = build_reverse_csr(&known, &status);
+    eprintln!("  {} reverse edges in {:.1}s", rev_edges.len(), t0.elapsed().as_secs_f64());
+
+    // Phase 4: Retrograde
+    eprintln!("Phase 4: Retrograde analysis...");
+    retrograde(&mut status, &mut remaining, &rev_offset, &rev_edges);
+
+    let total_win = status.iter().filter(|&&s| s == STATUS_WIN).count();
+    let total_lose = status.iter().filter(|&&s| s == STATUS_LOSE).count();
+    let total_draw = n - total_win - total_lose;
+    eprintln!("  {} win, {} lose, {} draw in {:.1}s",
+        total_win, total_lose, total_draw, t0.elapsed().as_secs_f64());
+
+    // Phase 5: Report
+    let init = canonical(initial_position());
+    let init_idx = known.binary_search(&init).unwrap();
+    let result = match status[init_idx] {
+        STATUS_WIN => "WIN (first player wins)",
+        STATUS_LOSE => "LOSE (second player wins)",
+        _ => "DRAW",
+    };
+
+    println!("Reachable positions: {}", n);
+    println!("  Win:  {}", total_win);
+    println!("  Lose: {}", total_lose);
+    println!("  Draw: {}", total_draw);
+    println!("Initial position: {}", result);
 }
