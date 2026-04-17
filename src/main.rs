@@ -11,6 +11,7 @@ const NUM_SQ: usize = (ROWS * COLS) as usize;
 const HAND_SHIFT: usize = NUM_SQ * 4;
 
 type Pos = u128;
+type EdgeIdx = u64; // cumulative edge offset; total edges can exceed u32::MAX
 
 #[inline]
 fn sq_idx(r: i32, c: i32) -> usize { (r * COLS + c) as usize }
@@ -253,7 +254,7 @@ impl EdgeBatch {
 fn flush_edge_batch(
     known: &[Pos],
     rev_edges: &mut [u32],
-    write_pos: &mut [u32],
+    write_pos: &mut [EdgeIdx],
     batch: &mut EdgeBatch,
 ) {
     let mut indices: Vec<u32> = (0..batch.len() as u32).collect();
@@ -273,7 +274,7 @@ fn flush_edge_batch(
 fn build_reverse_csr(
     known: &[Pos],
     status: &[u8],
-) -> (Vec<u32>, Vec<u32>) {
+) -> (Vec<EdgeIdx>, Vec<u32>) {
     let n = known.len();
     let mut in_degree: Vec<u32> = vec![0; n];
     let mut batch: Vec<Pos> = Vec::with_capacity(BATCH_CAP + 64);
@@ -295,15 +296,15 @@ fn build_reverse_csr(
     }
     drop(batch);
 
-    let mut rev_offset: Vec<u32> = vec![0; n + 1];
+    let mut rev_offset: Vec<EdgeIdx> = vec![0; n + 1];
     for i in 0..n {
-        rev_offset[i + 1] = rev_offset[i] + in_degree[i];
+        rev_offset[i + 1] = rev_offset[i] + in_degree[i] as EdgeIdx;
     }
     let total_edges = rev_offset[n] as usize;
     drop(in_degree);
 
     let mut rev_edges: Vec<u32> = vec![0; total_edges];
-    let mut write_pos: Vec<u32> = rev_offset[..n].to_vec();
+    let mut write_pos: Vec<EdgeIdx> = rev_offset[..n].to_vec();
     let mut edge_batch = EdgeBatch::new();
 
     for i in 0..n {
@@ -329,7 +330,7 @@ fn build_reverse_csr(
 fn retrograde(
     status: &mut [u8],
     remaining: &mut [u8],
-    rev_offset: &[u32],
+    rev_offset: &[EdgeIdx],
     rev_edges: &[u32],
 ) {
     let n = status.len();
