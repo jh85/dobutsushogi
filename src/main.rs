@@ -1,12 +1,13 @@
 // Count reachable positions in Dobutsu Shogi from the initial position.
 //
+// BFS level by level with sort-merge dedup (no hash table).
+//
 // Terminal positions (no successors):
 //   - forced-win: Black can capture White Lion
 //   - forced-loss: White Lion at row 3, Black cannot capture
 //
-// Chick drops on row 0 ARE allowed (chick sits immovable until captured).
+// Chick drops on row 0 ARE allowed.
 
-use rustc_hash::FxHashSet;
 use std::time::Instant;
 
 const ROWS: i32 = 4;
@@ -118,8 +119,8 @@ fn is_terminal(pos: u64) -> bool {
     wl / 3 == 3
 }
 
-fn generate_successors(pos: u64, out: &mut Vec<u64>) {
-    // Board moves
+fn generate_successors_canonical(pos: u64, out: &mut Vec<u64>) {
+    // Board moves — each successor is immediately flip+canonical'd
     for sq in 0..NUM_SQ {
         let p = get_sq(pos, sq);
         if !(1..=5).contains(&p) { continue; }
@@ -146,10 +147,10 @@ fn generate_successors(pos: u64, out: &mut Vec<u64>) {
                 };
                 np = set_hand(np, hi, get_hand(np, hi) + 1);
             }
-            out.push(np);
+            out.push(canonical(flip_perspective(np)));
         }
     }
-    // Drops (Chick drop on row 0 is allowed)
+    // Drops
     for hi in 0..3 {
         let cnt = get_hand(pos, hi);
         if cnt == 0 { continue; }
@@ -159,41 +160,93 @@ fn generate_successors(pos: u64, out: &mut Vec<u64>) {
             let mut np = pos;
             np = set_sq(np, sq, drop_piece);
             np = set_hand(np, hi, cnt - 1);
-            out.push(np);
+            out.push(canonical(flip_perspective(np)));
+        }
+    }
+}
+
+// Merge `new_sorted` (sorted, non-empty) into `known` (sorted) in-place.
+fn merge_into(known: &mut Vec<u64>, new_sorted: &[u64]) {
+    let old_len = known.len();
+    known.resize(old_len + new_sorted.len(), 0);
+    let mut i = old_len;
+    let mut j = new_sorted.len();
+    let mut k = known.len();
+    while i > 0 && j > 0 {
+        k -= 1;
+        if known[i - 1] >= new_sorted[j - 1] {
+            known[k] = known[i - 1];
+            i -= 1;
+        } else {
+            known[k] = new_sorted[j - 1];
+            j -= 1;
+        }
+    }
+    while j > 0 {
+        k -= 1;
+        known[k] = new_sorted[j - 1];
+        j -= 1;
+    }
+}
+
+// Find elements in `candidates` (sorted, deduped) that are NOT in `known` (sorted).
+fn diff_sorted(known: &[u64], candidates: &[u64], out: &mut Vec<u64>) {
+    out.clear();
+    let mut ki = 0;
+    for &c in candidates {
+        while ki < known.len() && known[ki] < c {
+            ki += 1;
+        }
+        if ki >= known.len() || known[ki] != c {
+            out.push(c);
         }
     }
 }
 
 fn main() {
     let init = canonical(initial_position());
-    let mut visited: FxHashSet<u64> = FxHashSet::default();
-    let mut all: Vec<u64> = Vec::new();
-    visited.insert(init);
-    all.push(init);
-    let mut succ: Vec<u64> = Vec::with_capacity(80);
-    let mut i: usize = 0;
-    let start = Instant::now();
-    let mut next_log = 1_000_000usize;
+    let mut known: Vec<u64> = vec![init];
+    let mut frontier: Vec<u64> = vec![init];
+    let mut raw_succs: Vec<u64> = Vec::new();
+    let mut new_positions: Vec<u64> = Vec::new();
 
-    while i < all.len() {
-        let pos = all[i];
-        i += 1;
-        if !is_terminal(pos) {
-            succ.clear();
-            generate_successors(pos, &mut succ);
-            for &sp in succ.iter() {
-                let canon = canonical(flip_perspective(sp));
-                if visited.insert(canon) {
-                    all.push(canon);
-                }
+    let start = Instant::now();
+
+    for level in 1.. {
+        raw_succs.clear();
+        for &pos in &frontier {
+            if !is_terminal(pos) {
+                generate_successors_canonical(pos, &mut raw_succs);
             }
         }
-        if i >= next_log {
-            eprintln!("[{:>7.1}s] processed {:>10} / discovered {:>10}",
-                start.elapsed().as_secs_f64(), i, all.len());
-            next_log += 1_000_000;
+
+        if raw_succs.is_empty() {
+            break;
         }
+
+        raw_succs.sort_unstable();
+        raw_succs.dedup();
+
+        diff_sorted(&known, &raw_succs, &mut new_positions);
+
+        if new_positions.is_empty() {
+            break;
+        }
+
+        merge_into(&mut known, &new_positions);
+
+        eprintln!(
+            "[{:>7.1}s] level {:>3}: +{:>10}  = {:>10} total  (raw succs: {:>10})",
+            start.elapsed().as_secs_f64(),
+            level,
+            new_positions.len(),
+            known.len(),
+            raw_succs.len()
+        );
+
+        std::mem::swap(&mut frontier, &mut new_positions);
     }
+
     eprintln!("done in {:.1}s", start.elapsed().as_secs_f64());
-    println!("Reachable positions: {}", all.len());
+    println!("Reachable positions: {}", known.len());
 }

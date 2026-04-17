@@ -37,4 +37,4 @@ Left-right mirror positions are identified (canonical = min of position and its 
 cargo run --release
 ```
 
-Requires ~5 GB RAM. Runs in approximately 2.5 hours on a single core.
+Requires ~4 GB RAM. Runs in about 75 seconds on a modern machine (sort-merge BFS, no hash table).
