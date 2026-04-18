@@ -9,16 +9,6 @@ constants in `src/main.rs`.
 
 ### Standard 4×3 board
 
-+-+-+-+
-|g|l|e|
-+-+-+-+
-| |c| |
-+-+-+-+
-| |C| |
-+-+-+-+
-|E|L|G|
-+-+-+-+
-
 **246,803,167** reachable positions from the initial position, matching Tanaka (2009).
 
 | Category | Positions | Share |
