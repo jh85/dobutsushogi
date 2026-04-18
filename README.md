@@ -73,15 +73,39 @@ Approximate resources by board size:
 |---|---:|---:|---:|---:|
 | 4×3 | 2.47·10⁸ | 9.39·10⁸ | ~12 GB | ~7 min |
 | 5×3 | 3.36·10⁹ | ~10¹⁰+ | ~230 GB | ~hours |
+| 6×3 | ~4-7·10¹⁰ (est.) | — | in-memory infeasible | — |
 
-5×3 requires a large-memory machine (≥256 GB recommended).
+5×3 requires a large-memory machine (≥256 GB recommended). 6×3 only fits
+with disk-based BFS + a streaming retrograde; see `src/bin/disk_bfs.rs`.
 
 ## Usage
 
-To run the currently configured board size:
+Two binaries, sharing the core game logic in `src/lib.rs`.
+
+**In-memory full solve** (BFS + retrograde). Suitable for boards up through ~5×3:
 
 ```
-cargo run --release
+cargo run --release --bin dobutsu_count
 ```
 
-To switch board size, edit `ROWS`, `COLS`, and `initial_position()` in `src/main.rs`.
+**Disk-based BFS** for larger boards. Writes sorted position files to disk
+and merges them via external sort-merge — keeps RAM use tiny regardless of
+how big the state space is. Currently performs Phase 1 (reachable-position
+count) only; retrograde-on-disk is future work.
+
+```
+cargo run --release --bin disk_bfs
+```
+
+Tune with env vars:
+- `DISK_BFS_DIR` — work directory for on-disk files (default `./disk_bfs_work`)
+- `DISK_BFS_RUN_POS` — positions per in-memory sort run (default `500_000_000`, ≈ 8 GiB). Larger values → fewer runs per level → faster merges.
+
+Example for the 760 GB machine (use 10 GiB sort buffer, put files on fast NVMe):
+```
+DISK_BFS_DIR=/mnt/nvme/dobutsu DISK_BFS_RUN_POS=625000000 \
+    cargo run --release --bin disk_bfs
+```
+
+To switch board size, edit `ROWS` and `COLS` in `src/lib.rs`. The initial
+position derives from `ROWS`/`COLS` automatically.
