@@ -3,7 +3,7 @@
 // Board dimensions and initial position are configurable via the constants below.
 // Encoding: 4 bits per square + 2 bits per hand count, packed into u128.
 
-pub const ROWS: i32 = 5;
+pub const ROWS: i32 = 4;
 pub const COLS: i32 = 3;
 pub const NUM_SQ: usize = (ROWS * COLS) as usize;
 pub const HAND_SHIFT: usize = NUM_SQ * 4;
